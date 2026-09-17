@@ -1,0 +1,17 @@
+{
+  "//": "Pins tools/patch_framework.py to the exact framework-arduinoespressif32 version and file contents these patches were verified against (see README). If a framework update changes framework_version or either pristine hash, the pre-build script aborts instead of silently applying a possibly-stale patch -- update this file only after re-reviewing the patch against the new upstream file.",
+  "framework_version": "3.1.3",
+  "kbonly_env": "esp32-s3-supermini-kbonly",
+  "files": {
+    "USBHID.cpp": {
+      "installed_path": "libraries/USB/src/USBHID.cpp",
+      "pristine_sha256": "027bd25dea97537b87ec1728624119df0bdb842e64d14ba720fe39036909e46f",
+      "patched_sha256": "6cb7e449386f85715bed3e57cf7d65bcc5f7e6c2cef066deececbbcd97012883"
+    },
+    "esp32-hal-tinyusb.c": {
+      "installed_path": "cores/esp32/esp32-hal-tinyusb.c",
+      "pristine_sha256": "63ef3eb19c1f52f9bb97ae4d729a318f417ddd81894d56a17cd3634b9888a7f9",
+      "patched_sha256": "61a3de4587b55345f0a1124bfaa16f553ce9ece611e1f10f88d9e372a0f96ce6"
+    }
+  }
+}
