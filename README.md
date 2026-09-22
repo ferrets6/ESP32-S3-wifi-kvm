@@ -6,6 +6,12 @@ local network through a web page with low-latency WebSocket input (touchpad,
 text keyboard, special keys/combos). Personal DIY project: software KVM /
 accessibility tool to control a PC from a phone or Raspberry Pi.
 
+This board's own control panel (below) is self-contained and works standalone.
+[remote-kvm](https://github.com/ferrets6/remote-kvm) wraps it (and
+[unifying-cc2544-radiokey](https://github.com/ferrets6/unifying-cc2544-radiokey)) as one
+of several pluggable HID drivers behind a single page that also shows live video from
+the target machine.
+
 ## Hardware
 
 - Chip: ESP32-S3 (4 MB flash, 2 MB PSRAM)
