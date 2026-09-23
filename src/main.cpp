@@ -46,9 +46,10 @@ unsigned long restartAtMs = 0;
 // compatibility, see platformio.ini), and the board is often plugged into a
 // host we have no other way to inspect (NAS, headless PC...), so this is the
 // only window into what the USB stack and WiFi are actually doing.
-static const int LOG_CAPACITY = 48;
+static const int LOG_CAPACITY = 100;
 String eventLog[LOG_CAPACITY];
 int eventLogCount = 0;
+bool logCommands = false;  // debug only: toggled from /status, off again after reboot
 
 void logEvent(const String &msg) {
   // Millisecond resolution matters here: BIOS/GRUB's whole USB negotiation
@@ -174,6 +175,140 @@ void setupWiFi() {
   }
 }
 
+// Who joins/leaves our AP, and why the STA link last dropped (the reason is
+// only stored here, then reported by the watchdog/retry logic below).
+uint8_t lastStaDisconnectReason = 0;
+
+String staDisconnectReason() {
+  return String(lastStaDisconnectReason) + " " + WiFi.disconnectReasonName((wifi_err_reason_t)lastStaDisconnectReason);
+}
+
+String macToString(const uint8_t *mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return buf;
+}
+
+void wifiEventHandler(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      lastStaDisconnectReason = info.wifi_sta_disconnected.reason;
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      logEvent("WiFi AP: client " + macToString(info.wifi_ap_staconnected.mac) + " joined");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+      logEvent("WiFi AP: client " + macToString(info.wifi_ap_staipassigned.mac) + " got IP " +
+               IPAddress(info.wifi_ap_staipassigned.ip.addr).toString());
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      logEvent("WiFi AP: client " + macToString(info.wifi_ap_stadisconnected.mac) + " left");
+      break;
+    default:
+      break;
+  }
+}
+
+// Runtime watchdog for STA mode: setupWiFi() only checks the link at boot.
+// Non-blocking so HID/WS keep running: each check fires one reconnect()
+// and the next check (WIFI_CHECK_MS later) is its timeout.
+static const uint32_t WIFI_CHECK_MS = 10000;
+static const uint8_t WIFI_MAX_RECONNECTS = 3;
+unsigned long wifiLastCheckMs = 0;
+uint8_t wifiReconnectAttempts = 0;
+
+// While in AP mode, periodically retry the saved network in AP+STA mode so
+// the AP stays up during the attempt. Skipped while someone is on the AP
+// (joining the router can move the radio's channel and drop them).
+static const uint32_t WIFI_AP_RETRY_MS = 60000;
+static const uint32_t WIFI_AP_RETRY_TIMEOUT_MS = 12000;
+unsigned long wifiApRetryStartMs = 0;  // non-zero while a retry is in flight
+uint16_t wifiApRetryFailures = 0;
+uint8_t wifiApRetryLastReason = 0;
+bool wifiApRetryPaused = false;
+
+// Only state changes are logged (first failure, a new failure reason,
+// pause/resume, success), not every attempt: one line a minute would push
+// everything else out of the event log within a couple of hours.
+void retrySavedNetwork() {
+  if (wifiApRetryStartMs) {
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.mode(WIFI_STA);  // drop the AP, back to normal operation
+      staConnected = true;
+      wifiApRetryStartMs = 0;
+      logEvent("WiFi: saved network '" + currentStaSsid + "' is back after " + String(wifiApRetryFailures) +
+               " failed retries, IP " + WiFi.localIP().toString() + ", AP stopped");
+      wifiApRetryFailures = 0;
+      wifiApRetryLastReason = 0;
+    } else if (millis() - wifiApRetryStartMs > WIFI_AP_RETRY_TIMEOUT_MS) {
+      // Read the reason before disconnect(), which records its own (ASSOC_LEAVE).
+      String reason = staDisconnectReason();
+      bool newReason = lastStaDisconnectReason != wifiApRetryLastReason;
+      wifiApRetryLastReason = lastStaDisconnectReason;
+      WiFi.disconnect();
+      WiFi.mode(WIFI_AP);
+      wifiApRetryStartMs = 0;
+      wifiApRetryFailures++;
+      if (wifiApRetryFailures == 1 || newReason) {
+        logEvent("WiFi: retry of '" + currentStaSsid + "' failed (reason " + reason + "), retrying every " +
+                 String(WIFI_AP_RETRY_MS / 1000) + "s while nobody is on the AP");
+      }
+    }
+    return;
+  }
+
+  if (currentStaSsid.isEmpty()) {
+    return;
+  }
+  bool clientsOnAp = WiFi.softAPgetStationNum() > 0;
+  if (clientsOnAp != wifiApRetryPaused) {
+    wifiApRetryPaused = clientsOnAp;
+    logEvent(clientsOnAp ? "WiFi: retries of '" + currentStaSsid + "' paused while a client is on the AP (" +
+                               String(wifiApRetryFailures) + " failed so far)"
+                         : "WiFi: AP empty again, resuming retries of '" + currentStaSsid + "'");
+  }
+  if (clientsOnAp || millis() - wifiLastCheckMs < WIFI_AP_RETRY_MS) {
+    return;
+  }
+  wifiLastCheckMs = millis();
+  Serial.printf("[wifi] AP mode: retrying saved network '%s'\n", currentStaSsid.c_str());
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(currentStaSsid.c_str(), prefs.getString("pass", "").c_str());
+  wifiApRetryStartMs = millis();
+}
+
+void checkWiFi() {
+  if (!staConnected) {
+    retrySavedNetwork();
+    return;
+  }
+  if (millis() - wifiLastCheckMs < WIFI_CHECK_MS) {
+    return;
+  }
+  wifiLastCheckMs = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiReconnectAttempts) {
+      logEvent("WiFi: reconnected to '" + currentStaSsid + "', IP " + WiFi.localIP().toString());
+      wifiReconnectAttempts = 0;
+    }
+    return;
+  }
+
+  if (wifiReconnectAttempts < WIFI_MAX_RECONNECTS) {
+    wifiReconnectAttempts++;
+    logEvent("WiFi: connection to '" + currentStaSsid + "' lost (reason " + staDisconnectReason() +
+             "), reconnect attempt " + String(wifiReconnectAttempts) + "/" + String(WIFI_MAX_RECONNECTS));
+    WiFi.reconnect();
+    return;
+  }
+
+  logEvent("WiFi: reconnect to '" + currentStaSsid + "' failed, falling back to AP");
+  staConnected = false;
+  wifiReconnectAttempts = 0;
+  startAccessPoint();
+}
+
 // ---------------------------------------------------------------------
 // HTTP routes
 // ---------------------------------------------------------------------
@@ -220,6 +355,14 @@ void setupHttpRoutes() {
     req->send(res);
   });
 
+  server.on("/logcmds", HTTP_POST, [](AsyncWebServerRequest *req) {
+    logCommands = req->hasParam("enabled", true);
+    logEvent(String("Settings: command logging turned ") + (logCommands ? "on" : "off"));
+    AsyncWebServerResponse *res = req->beginResponse(303);
+    res->addHeader("Location", "/status");
+    req->send(res);
+  });
+
   server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *req) {
     logEvent("Settings: reboot requested from web UI");
     req->send(200, "text/html",
@@ -247,7 +390,10 @@ void setupHttpRoutes() {
     html += "\nUSB connected to a host: " + String((bool)USB ? "yes" : "no");
     html += "\nCommand LED: " + String(ledEnabled ? "on" : "off");
     html += "\nWebSocket clients connected: " + String(ws.count());
-    html += "\n\n-- Event log (auto-refreshes every 3s) --\n";
+    html += "\n<form method='post' action='/logcmds' style='margin:8px 0 0'><label><input type='checkbox' "
+            "name='enabled' onchange='this.form.submit()'" + String(logCommands ? " checked" : "") +
+            "> Log every keyboard/mouse command (debug)</label></form>";
+    html += "\n-- Event log (auto-refreshes every 3s) --\n";
     int n = min(eventLogCount, LOG_CAPACITY);
     int start = eventLogCount > LOG_CAPACITY ? eventLogCount % LOG_CAPACITY : 0;
     if (n == 0) {
@@ -276,6 +422,12 @@ void setupHttpRoutes() {
 //   kk:<name>       special key        (see hid_bridge.h)
 //   kc:<name>       key combo          (see hid_bridge.h)
 //   kg:<mods>:<key> generic held-modifier combo (see hidModCombo)
+//
+// The commands above are the control panel's: they type characters through
+// the Italian layout. For clients that need a plain keyboard instead:
+//   hr:<mod>:<usage>:<1|0>  raw HID key down(1)/up(0), no layout involved
+//                   (see hidRawKey). mod = HID modifier byte, usage = HID
+//                   usage of the physical key; decimal or 0x-prefixed hex
 // ---------------------------------------------------------------------
 
 void handleWsMessage(const String &msg) {
@@ -283,10 +435,10 @@ void handleWsMessage(const String &msg) {
   String cmd = (c1 < 0) ? msg : msg.substring(0, c1);
   String rest = (c1 < 0) ? "" : msg.substring(c1 + 1);
 
-  if (cmd != "mm") {
-    // Every command except mouse-move (way too frequent during a drag,
-    // would flood the ring buffer) so /status shows exactly what was sent
-    // and when, alongside the USB-level events.
+  if (logCommands && cmd != "mm") {
+    // Debug (checkbox on /status): every command except mouse-move (way too
+    // frequent during a drag, would flood the ring buffer) so /status shows
+    // exactly what was sent and when, alongside the USB-level events.
     logEvent("CMD: " + msg);
   }
 
@@ -316,6 +468,17 @@ void handleWsMessage(const String &msg) {
       return;
     }
     hidModCombo(rest.substring(0, c2), rest.substring(c2 + 1));
+  } else if (cmd == "hr") {
+    char *end;
+    uint8_t mod = strtoul(rest.c_str(), &end, 0);
+    if (*end != ':') {
+      return;
+    }
+    uint8_t usage = strtoul(end + 1, &end, 0);
+    if (*end != ':') {
+      return;
+    }
+    hidRawKey(mod, usage, end[1] == '1');
   } else if (cmd == "lt") {
     // Diagnostic only: "lt:<gpio>" flashes that pin as a WS2812 RGB LED
     // (dim blue, ~300ms) so the correct onboard-LED pin can be found
@@ -343,6 +506,10 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
   } else if (type == WS_EVT_DISCONNECT) {
     Serial.printf("[ws] client #%u disconnected\n", client->id());
     logEvent("WS: client #" + String(client->id()) + " disconnected");
+    // A client that drops between an hr: down and its up (tab closed, WiFi lost) would leave
+    // keys stuck down on the host forever. Releasing on any disconnect can
+    // cut short a key another client is holding; far better than stuck Ctrl.
+    hidReleaseAllKeys();
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
@@ -438,6 +605,7 @@ void setup() {
 
   prefs.begin("wifi", false);
   ledEnabled = prefs.getBool("ledEnabled", true);
+  WiFi.onEvent(wifiEventHandler);
   setupWiFi();
 
   ws.onEvent(onWsEvent);
@@ -454,6 +622,7 @@ void setup() {
 void loop() {
   ws.cleanupClients();
   ElegantOTA.loop();
+  checkWiFi();
   if (ledOffAtMs && millis() > ledOffAtMs) {
     rgbLedWrite(LED_PIN, 0, 0, 0);
     ledOffAtMs = 0;

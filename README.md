@@ -98,9 +98,36 @@ HID presses, works with paste), special keys, and common combos
 (Ctrl+C/V/X/A/Z/S, Alt+Tab, Win). Talks to the board over a WebSocket
 (`/ws`) using a minimal text protocol.
 
-Includes an Italian extended keymap (`it_keymap.cpp`) for accented
-letters/symbols not covered by the core's built-in `it_IT` layout — requires
-the target PC's OS keyboard layout to actually be set to Italian.
+The panel's own commands (`kt:` text, `kk:` special key, `kc:`/`kg:` combos)
+type characters through the board's Italian layout: the core's built-in
+`it_IT` table plus an extended keymap (`it_keymap.cpp`) for accented
+letters/symbols it doesn't cover. Requires the target PC's OS keyboard
+layout to actually be set to Italian.
+
+## Raw HID API
+
+For other clients (e.g. [remote-kvm](https://github.com/ferrets6/remote-kvm))
+the board also behaves as a plain keyboard, with no layout or keymap on the
+board: it sends the physical key and the target OS decides what it means,
+exactly like a real keyboard. Same WebSocket (`/ws`), one text frame per
+event:
+
+```
+hr:<mod>:<usage>:<1|0>
+```
+
+- `mod`: full HID modifier byte, the modifier state to hold from now on
+  (`0x01` LCtrl, `0x02` LShift, `0x04` LAlt, `0x08` LGui, `0x10` RCtrl,
+  `0x20` RShift, `0x40` RAlt/AltGr, `0x80` RGui).
+- `usage`: HID Keyboard/Keypad usage of the physical key (`0x04` = A,
+  `0x28` = Enter, ...). `0xE0`-`0xE7` act as the matching modifier bit;
+  `0` changes only the modifiers.
+- `1` = key down (held until its up, so the host auto-repeats; a repeated
+  down for a held key is ignored), `0` = key up.
+- Numbers are decimal or `0x` hex, e.g. Shift+A: `hr:0x02:0x04:1`,
+  `hr:0x02:0x04:0`, `hr:0:0:0`.
+- Up to 6 non-modifier keys held at once. Everything is released when any
+  WebSocket client disconnects, so a dropped client can't leave a key stuck.
 
 ## Security
 

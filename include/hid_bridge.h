@@ -40,3 +40,20 @@ void hidCombo(const String &name);
 // typed, e.g. Ctrl+"c") or one of the special names accepted by
 // hidSpecialKey (e.g. Ctrl+Shift+"ARROW_LEFT" to select a word left).
 void hidModCombo(const String &mods, const String &key);
+
+// Pure HID keyboard event, with no layout or keymap involved: the target
+// OS resolves what the key means, exactly as with a real keyboard. Same
+// shape as the Unifying dongle's SEND_KEY (modifier byte + usage + down).
+//   modifiers: full HID modifier byte, applied as the new held state
+//              (0x01 LCtrl, 0x02 LShift, 0x04 LAlt, 0x08 LGui,
+//               0x10 RCtrl, 0x20 RShift, 0x40 RAlt/AltGr, 0x80 RGui)
+//   usage:     HID Keyboard/Keypad page usage of the physical key (0x04 = A,
+//              0x28 = Enter...); 0xE0-0xE7 act as the matching modifier bit;
+//              0 updates only the modifiers
+//   down:      true = press (held until the matching up; a repeated down
+//              for a held key is ignored), false = release
+// Up to 6 non-modifier keys can be held at once (boot report limit).
+void hidRawKey(uint8_t modifiers, uint8_t usage, bool down);
+
+// Releases every held key and modifier (e.g. when the client holding them goes away).
+void hidReleaseAllKeys();

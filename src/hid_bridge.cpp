@@ -277,3 +277,49 @@ void hidModCombo(const String &mods, const String &key) {
     Keyboard.release(modKeys[i - 1]);
   }
 }
+
+namespace {
+// Modifier state last applied by hidRawKey(), so only bits that actually
+// change are sent (one HID report each).
+uint8_t rawHeldModifiers = 0;
+
+void applyRawModifiers(uint8_t modifiers) {
+  uint8_t changed = modifiers ^ rawHeldModifiers;
+  for (uint8_t bit = 0; bit < 8; bit++) {
+    if (changed & (1 << bit)) {
+      if (modifiers & (1 << bit)) {
+        Keyboard.pressRaw(0xE0 + bit);
+      } else {
+        Keyboard.releaseRaw(0xE0 + bit);
+      }
+    }
+  }
+  rawHeldModifiers = modifiers;
+}
+}  // namespace
+
+void hidRawKey(uint8_t modifiers, uint8_t usage, bool down) {
+  if (usage >= 0xE0 && usage <= 0xE7) {
+    uint8_t bit = 1 << (usage - 0xE0);
+    modifiers = down ? (modifiers | bit) : (modifiers & ~bit);
+    usage = 0;
+  }
+  // Modifiers go down before the key and come up after it, like a real
+  // keyboard, so e.g. Shift+A never reaches the host as a bare "a".
+  if (down) {
+    applyRawModifiers(modifiers);
+    if (usage) {
+      Keyboard.pressRaw(usage);
+    }
+  } else {
+    if (usage) {
+      Keyboard.releaseRaw(usage);
+    }
+    applyRawModifiers(modifiers);
+  }
+}
+
+void hidReleaseAllKeys() {
+  Keyboard.releaseAll();
+  rawHeldModifiers = 0;
+}
